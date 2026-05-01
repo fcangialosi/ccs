@@ -14,6 +14,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -79,6 +80,7 @@ type pidEntry struct {
 type item struct {
 	session      Session
 	projectShort string
+	jsonlPath    string
 }
 
 func (i item) Title() string {
@@ -147,8 +149,9 @@ var (
 // ── Key bindings ────────────────────────────────────────────────────
 
 type keyMap struct {
-	toggleAll    key.Binding
-	toggleActive key.Binding
+	toggleAll     key.Binding
+	toggleActive  key.Binding
+	contentSearch key.Binding
 }
 
 var keys = keyMap{
@@ -159,6 +162,10 @@ var keys = keyMap{
 	toggleActive: key.NewBinding(
 		key.WithKeys("ctrl+a"),
 		key.WithHelp("ctrl+a", "active only"),
+	),
+	contentSearch: key.NewBinding(
+		key.WithKeys("ctrl+f"),
+		key.WithHelp("ctrl+f", "search contents"),
 	),
 }
 
@@ -173,6 +180,11 @@ type model struct {
 	quitting   bool
 	width      int
 	height     int
+
+	searchInput    textinput.Model
+	searching      bool            // input is focused
+	contentQuery   string          // active query (after enter)
+	contentMatches map[string]bool // session IDs whose JSONL contains contentQuery
 }
 
 func (m model) Init() tea.Cmd { return nil }
@@ -186,6 +198,9 @@ func (m model) applyFilters() model {
 		if m.activeOnly && !it.session.Active {
 			continue
 		}
+		if m.contentMatches != nil && !m.contentMatches[it.session.SessionID] {
+			continue
+		}
 		filtered = append(filtered, it)
 	}
 	m.list.SetItems(filtered)
@@ -195,6 +210,33 @@ func (m model) applyFilters() model {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.searching {
+			switch msg.String() {
+			case "enter":
+				m.contentQuery = strings.TrimSpace(m.searchInput.Value())
+				m.searching = false
+				m.searchInput.Blur()
+				if m.contentQuery == "" {
+					m.contentMatches = nil
+				} else {
+					m.contentMatches = searchAllContents(m.allItems, m.contentQuery)
+				}
+				m = m.applyFilters()
+				return m, nil
+			case "esc":
+				m.searching = false
+				m.searchInput.Blur()
+				m.searchInput.SetValue(m.contentQuery)
+				return m, nil
+			case "ctrl+c":
+				m.quitting = true
+				return m, tea.Quit
+			}
+			var cmd tea.Cmd
+			m.searchInput, cmd = m.searchInput.Update(msg)
+			return m, cmd
+		}
+
 		if m.list.FilterState() != list.Filtering {
 			switch {
 			case key.Matches(msg, keys.toggleAll):
@@ -205,6 +247,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.activeOnly = !m.activeOnly
 				m = m.applyFilters()
 				return m, nil
+			case key.Matches(msg, keys.contentSearch):
+				m.searching = true
+				m.searchInput.Focus()
+				return m, textinput.Blink
 			}
 
 			switch msg.String() {
@@ -214,7 +260,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.quitting = true
 					return m, tea.Quit
 				}
-			case "q", "ctrl+c", "esc":
+			case "q", "ctrl+c":
+				m.quitting = true
+				return m, tea.Quit
+			case "esc":
+				if m.contentQuery != "" {
+					m.contentQuery = ""
+					m.contentMatches = nil
+					m.searchInput.SetValue("")
+					m = m.applyFilters()
+					return m, nil
+				}
 				m.quitting = true
 				return m, tea.Quit
 			}
@@ -223,6 +279,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.list.SetSize(msg.Width, msg.Height-2)
+		m.searchInput.Width = msg.Width - 12
 	}
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
@@ -234,16 +291,21 @@ func (m model) View() string {
 		return ""
 	}
 
-	// Status bar with toggle indicators
-	namedLabel := filterToggle("named", m.namedOnly)
-	activeLabel := filterToggle("active", m.activeOnly)
+	var bottom string
+	if m.searching {
+		bottom = statusBarStyle.Render(m.searchInput.View())
+	} else {
+		namedLabel := filterToggle("named", m.namedOnly)
+		activeLabel := filterToggle("active", m.activeOnly)
+		count := len(m.list.Items())
+		left := fmt.Sprintf("%s  %s", namedLabel, activeLabel)
+		if m.contentQuery != "" {
+			left += "  " + filterOnStyle.Render("search: "+m.contentQuery)
+		}
+		bottom = statusBarStyle.Render(fmt.Sprintf("%s  │  %d sessions", left, count))
+	}
 
-	count := len(m.list.Items())
-	status := statusBarStyle.Render(
-		fmt.Sprintf("%s  %s  │  %d sessions", namedLabel, activeLabel, count),
-	)
-
-	return m.list.View() + "\n" + status
+	return m.list.View() + "\n" + bottom
 }
 
 func filterToggle(label string, on bool) string {
@@ -319,6 +381,7 @@ func loadAllSessions() []item {
 			indexedIDs[sid] = true
 
 			jf := filepath.Join(dir, sid+".jsonl")
+			indexed[idx].jsonlPath = jf
 			if title := extractCustomTitle(jf); title != "" {
 				indexed[idx].session.Name = title
 			}
@@ -472,7 +535,38 @@ func loadFromJSONL(path, home string, activeSessions map[string]string) *item {
 			Active:      active,
 		},
 		projectShort: shortenPath(cwd, home),
+		jsonlPath:    path,
 	}
+}
+
+func searchAllContents(items []item, query string) map[string]bool {
+	matches := make(map[string]bool)
+	q := strings.ToLower(query)
+	for _, it := range items {
+		if it.jsonlPath == "" {
+			continue
+		}
+		if jsonlContains(it.jsonlPath, q) {
+			matches[it.session.SessionID] = true
+		}
+	}
+	return matches
+}
+
+func jsonlContains(path, queryLower string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	for scanner.Scan() {
+		if strings.Contains(strings.ToLower(scanner.Text()), queryLower) {
+			return true
+		}
+	}
+	return false
 }
 
 func extractPromptText(raw json.RawMessage) string {
@@ -571,11 +665,13 @@ Usage:
   ccs -h           Show this help
 
 Keys:
-  /                Start filtering
+  /                Start filtering (metadata)
+  ctrl+f           Search session contents
   tab              Toggle named / all sessions
   ctrl+a           Toggle active-only
   enter            Select session
-  q, esc           Quit`)
+  esc              Clear content search / quit
+  q                Quit`)
 			return
 		case "-v", "--version":
 			fmt.Println("ccs 0.1.0")
@@ -605,13 +701,20 @@ Keys:
 	l.SetFilteringEnabled(true)
 	l.SetShowHelp(true)
 	l.AdditionalShortHelpKeys = func() []key.Binding {
-		return []key.Binding{keys.toggleAll, keys.toggleActive}
+		return []key.Binding{keys.toggleAll, keys.toggleActive, keys.contentSearch}
 	}
 
+	ti := textinput.New()
+	ti.Placeholder = "search session contents..."
+	ti.Prompt = "search: "
+	ti.CharLimit = 200
+	ti.Width = 60
+
 	m := model{
-		list:      l,
-		allItems:  allItems,
-		namedOnly: namedOnly,
+		list:        l,
+		allItems:    allItems,
+		namedOnly:   namedOnly,
+		searchInput: ti,
 	}
 	m = m.applyFilters()
 
