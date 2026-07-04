@@ -25,7 +25,7 @@ make build    # build binary
 make check    # vet + compile check
 ```
 
-No tests yet. To verify changes, run `./ccs --list` (plain text, no TTY needed) and `./ccs` (interactive TUI).
+`go test ./...` covers the search matching logic (`search_test.go`). For UI changes, verify with `./ccs --list` (plain text, no TTY needed) and `./ccs` (interactive TUI). The TUI can be driven headlessly under tmux: `tmux new-session -d -x 120 -y 35 "./ccs -a"`, `tmux send-keys`, `tmux capture-pane -p -e` (`-e` keeps escape codes — useful for catching render corruption).
 
 ## Key decisions
 
@@ -34,3 +34,4 @@ No tests yet. To verify changes, run `./ccs --list` (plain text, no TTY needed) 
 - Active detection: check if the PID in `~/.claude/sessions/<pid>.json` is alive via `kill(pid, 0)`.
 - The binary outputs raw data (path + session ID); the shell wrapper handles `cd` because a child process can't change the parent's cwd.
 - All bubbletea model methods use value receivers for consistency. `applyFilters()` returns the modified model.
+- **Search** (`/` or `ctrl+f`) is a single unified box over names *and* JSONL contents. Bubbles' built-in list filtering is deliberately **disabled** (`SetFilteringEnabled(false)`): its match-highlighter splices style codes into our already-ANSI-styled `Title()` strings and corrupts the render. Names/metadata filter instantly on keystroke; full-content matches stream in from a debounced background scan (`searchContents`, parallel across CPUs, seq-tagged so stale scans are dropped). `fileContainsAll` reads in bounded chunks with overlap — no line-length limit. up/down navigate while the input is focused; enter resumes the highlighted match. Future scaling ideas (ripgrep-if-installed, persistent index) are in `docs/search-scaling.md`.

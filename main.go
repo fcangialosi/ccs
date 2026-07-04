@@ -2,13 +2,16 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -144,17 +147,22 @@ var (
 	statusBarStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Padding(0, 1)
 	filterOnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	filterOffStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+	scanningStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
 // ── Key bindings ────────────────────────────────────────────────────
 
 type keyMap struct {
-	toggleAll     key.Binding
-	toggleActive  key.Binding
-	contentSearch key.Binding
+	search       key.Binding
+	toggleAll    key.Binding
+	toggleActive key.Binding
 }
 
 var keys = keyMap{
+	search: key.NewBinding(
+		key.WithKeys("/", "ctrl+f"),
+		key.WithHelp("/", "search names+contents"),
+	),
 	toggleAll: key.NewBinding(
 		key.WithKeys("tab"),
 		key.WithHelp("tab", "named/all"),
@@ -162,10 +170,6 @@ var keys = keyMap{
 	toggleActive: key.NewBinding(
 		key.WithKeys("ctrl+a"),
 		key.WithHelp("ctrl+a", "active only"),
-	),
-	contentSearch: key.NewBinding(
-		key.WithKeys("ctrl+f"),
-		key.WithHelp("ctrl+f", "search contents"),
 	),
 }
 
@@ -183,13 +187,50 @@ type model struct {
 
 	searchInput    textinput.Model
 	searching      bool            // input is focused
-	contentQuery   string          // active query (after enter)
-	contentMatches map[string]bool // session IDs whose JSONL contains contentQuery
+	searchSeq      int             // bumped on every query change; tags async scans
+	scanning       bool            // a background content scan is in flight
+	contentQuery   string          // query the current contentMatches correspond to
+	contentMatches map[string]bool // session IDs whose JSONL contents match contentQuery
+}
+
+// debounceMsg fires a short while after the query stops changing; if its seq is
+// still current we launch the content scan.
+type debounceMsg struct {
+	seq   int
+	query string
+}
+
+// scanResultMsg carries the result of a background content scan.
+type scanResultMsg struct {
+	seq     int
+	query   string
+	matches map[string]bool
+}
+
+const searchDebounce = 200 * time.Millisecond
+
+func debounceCmd(seq int, query string) tea.Cmd {
+	return tea.Tick(searchDebounce, func(time.Time) tea.Msg {
+		return debounceMsg{seq: seq, query: query}
+	})
+}
+
+func scanCmd(items []item, seq int, query string) tea.Cmd {
+	return func() tea.Msg {
+		return scanResultMsg{seq: seq, query: query, matches: searchContents(items, query)}
+	}
 }
 
 func (m model) Init() tea.Cmd { return nil }
 
+func (m model) query() string { return strings.TrimSpace(m.searchInput.Value()) }
+
 func (m model) applyFilters() model {
+	terms := strings.Fields(strings.ToLower(m.query()))
+	// Content matches only count when they were computed for the live query;
+	// while typing they lag behind until the debounced scan catches up.
+	contentCurrent := m.contentMatches != nil && m.contentQuery == m.query()
+
 	var filtered []list.Item
 	for _, it := range m.allItems {
 		if m.namedOnly && it.session.Name == "" {
@@ -198,8 +239,12 @@ func (m model) applyFilters() model {
 		if m.activeOnly && !it.session.Active {
 			continue
 		}
-		if m.contentMatches != nil && !m.contentMatches[it.session.SessionID] {
-			continue
+		if len(terms) > 0 {
+			meta := metaContainsAll(it, terms)
+			content := contentCurrent && m.contentMatches[it.session.SessionID]
+			if !meta && !content {
+				continue
+			}
 		}
 		filtered = append(filtered, it)
 	}
@@ -207,74 +252,82 @@ func (m model) applyFilters() model {
 	return m
 }
 
+// metaContainsAll reports whether every term appears somewhere in the session's
+// metadata (name, summary, first prompt, path, branch), case-insensitively.
+func metaContainsAll(it item, termsLower []string) bool {
+	hay := strings.ToLower(strings.Join([]string{
+		it.session.Name,
+		it.session.Summary,
+		it.session.FirstPrompt,
+		it.projectShort,
+		it.session.ProjectPath,
+		it.session.GitBranch,
+	}, " "))
+	for _, t := range termsLower {
+		if !strings.Contains(hay, t) {
+			return false
+		}
+	}
+	return true
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if m.searching {
-			switch msg.String() {
-			case "enter":
-				m.contentQuery = strings.TrimSpace(m.searchInput.Value())
-				m.searching = false
-				m.searchInput.Blur()
-				if m.contentQuery == "" {
-					m.contentMatches = nil
-				} else {
-					m.contentMatches = searchAllContents(m.allItems, m.contentQuery)
-				}
-				m = m.applyFilters()
-				return m, nil
-			case "esc":
-				m.searching = false
-				m.searchInput.Blur()
-				m.searchInput.SetValue(m.contentQuery)
-				return m, nil
-			case "ctrl+c":
-				m.quitting = true
-				return m, tea.Quit
-			}
-			var cmd tea.Cmd
-			m.searchInput, cmd = m.searchInput.Update(msg)
-			return m, cmd
+			return m.updateSearching(msg)
 		}
 
-		if m.list.FilterState() != list.Filtering {
-			switch {
-			case key.Matches(msg, keys.toggleAll):
-				m.namedOnly = !m.namedOnly
-				m = m.applyFilters()
-				return m, nil
-			case key.Matches(msg, keys.toggleActive):
-				m.activeOnly = !m.activeOnly
-				m = m.applyFilters()
-				return m, nil
-			case key.Matches(msg, keys.contentSearch):
-				m.searching = true
-				m.searchInput.Focus()
-				return m, textinput.Blink
-			}
-
-			switch msg.String() {
-			case "enter":
-				if sel, ok := m.list.SelectedItem().(item); ok {
-					m.selected = &sel
-					m.quitting = true
-					return m, tea.Quit
-				}
-			case "q", "ctrl+c":
-				m.quitting = true
-				return m, tea.Quit
-			case "esc":
-				if m.contentQuery != "" {
-					m.contentQuery = ""
-					m.contentMatches = nil
-					m.searchInput.SetValue("")
-					m = m.applyFilters()
-					return m, nil
-				}
-				m.quitting = true
-				return m, tea.Quit
-			}
+		switch {
+		case key.Matches(msg, keys.search):
+			m.searching = true
+			m.searchInput.Focus()
+			return m, textinput.Blink
+		case key.Matches(msg, keys.toggleAll):
+			m.namedOnly = !m.namedOnly
+			m = m.applyFilters()
+			return m, nil
+		case key.Matches(msg, keys.toggleActive):
+			m.activeOnly = !m.activeOnly
+			m = m.applyFilters()
+			return m, nil
 		}
+
+		switch msg.String() {
+		case "enter":
+			if sel, ok := m.list.SelectedItem().(item); ok {
+				m.selected = &sel
+				m.quitting = true
+				return m, tea.Quit
+			}
+		case "q", "ctrl+c":
+			m.quitting = true
+			return m, tea.Quit
+		case "esc":
+			if m.query() != "" {
+				m = m.clearSearch()
+				return m, nil
+			}
+			m.quitting = true
+			return m, tea.Quit
+		}
+
+	case debounceMsg:
+		// Only launch the scan if no newer keystroke has arrived since.
+		if msg.seq == m.searchSeq && strings.TrimSpace(msg.query) != "" {
+			return m, scanCmd(m.allItems, msg.seq, msg.query)
+		}
+		return m, nil
+
+	case scanResultMsg:
+		if msg.seq == m.searchSeq {
+			m.contentMatches = msg.matches
+			m.contentQuery = strings.TrimSpace(msg.query)
+			m.scanning = false
+			m = m.applyFilters()
+		}
+		return m, nil
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -286,21 +339,83 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// updateSearching handles keys while the search input is focused.
+func (m model) updateSearching(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		// Resume whatever is highlighted in the (live-filtered) list.
+		if sel, ok := m.list.SelectedItem().(item); ok {
+			m.selected = &sel
+			m.quitting = true
+			return m, tea.Quit
+		}
+		return m, nil
+	case "esc":
+		m = m.clearSearch()
+		m.searching = false
+		m.searchInput.Blur()
+		return m, nil
+	case "ctrl+c":
+		m.quitting = true
+		return m, tea.Quit
+	case "up", "down", "pgup", "pgdown":
+		// Navigate the results without leaving the search box.
+		var cmd tea.Cmd
+		m.list, cmd = m.list.Update(msg)
+		return m, cmd
+	}
+
+	prev := m.searchInput.Value()
+	var cmd tea.Cmd
+	m.searchInput, cmd = m.searchInput.Update(msg)
+	cmds := []tea.Cmd{cmd}
+
+	if m.searchInput.Value() != prev {
+		m.searchSeq++
+		if m.query() == "" {
+			m.scanning = false
+			m.contentMatches = nil
+			m.contentQuery = ""
+		} else {
+			m.scanning = true
+			cmds = append(cmds, debounceCmd(m.searchSeq, m.searchInput.Value()))
+		}
+		m = m.applyFilters() // instant metadata narrowing; contents stream in later
+	}
+	return m, tea.Batch(cmds...)
+}
+
+// clearSearch drops the active query and any content matches, then re-filters.
+func (m model) clearSearch() model {
+	m.searchInput.SetValue("")
+	m.searchSeq++
+	m.scanning = false
+	m.contentMatches = nil
+	m.contentQuery = ""
+	return m.applyFilters()
+}
+
 func (m model) View() string {
 	if m.quitting {
 		return ""
 	}
 
+	count := len(m.list.Items())
+
 	var bottom string
 	if m.searching {
-		bottom = statusBarStyle.Render(m.searchInput.View())
+		status := ""
+		if m.scanning {
+			status = scanningStyle.Render("  ⋯ scanning contents")
+		}
+		bottom = statusBarStyle.Render(m.searchInput.View()) + status +
+			statusBarStyle.Render(fmt.Sprintf("  │  %d", count))
 	} else {
 		namedLabel := filterToggle("named", m.namedOnly)
 		activeLabel := filterToggle("active", m.activeOnly)
-		count := len(m.list.Items())
 		left := fmt.Sprintf("%s  %s", namedLabel, activeLabel)
-		if m.contentQuery != "" {
-			left += "  " + filterOnStyle.Render("search: "+m.contentQuery)
+		if q := m.query(); q != "" {
+			left += "  " + filterOnStyle.Render("search: "+q)
 		}
 		bottom = statusBarStyle.Render(fmt.Sprintf("%s  │  %d sessions", left, count))
 	}
@@ -539,34 +654,116 @@ func loadFromJSONL(path, home string, activeSessions map[string]string) *item {
 	}
 }
 
-func searchAllContents(items []item, query string) map[string]bool {
+// searchContents scans every session's JSONL for the query, in parallel across
+// CPUs. A session matches if all whitespace-separated terms appear somewhere in
+// its file (case-insensitive). Returns the set of matching session IDs.
+func searchContents(items []item, query string) map[string]bool {
+	terms := strings.Fields(query)
+	if len(terms) == 0 {
+		return nil
+	}
+	needles := make([][]byte, len(terms))
+	for i, t := range terms {
+		needles[i] = asciiLower([]byte(t))
+	}
+
 	matches := make(map[string]bool)
-	q := strings.ToLower(query)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU())
+
 	for _, it := range items {
 		if it.jsonlPath == "" {
 			continue
 		}
-		if jsonlContains(it.jsonlPath, q) {
-			matches[it.session.SessionID] = true
-		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(it item) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if fileContainsAll(it.jsonlPath, needles) {
+				mu.Lock()
+				matches[it.session.SessionID] = true
+				mu.Unlock()
+			}
+		}(it)
 	}
+	wg.Wait()
 	return matches
 }
 
-func jsonlContains(path, queryLower string) bool {
+// fileContainsAll reports whether every needle (already ASCII-lowercased)
+// appears somewhere in the file. It reads in bounded chunks and carries a small
+// overlap so matches spanning a chunk boundary are still found — this avoids
+// the old bufio.Scanner buffer limit that silently skipped >1MB JSONL lines.
+func fileContainsAll(path string, needles [][]byte) bool {
+	if len(needles) == 0 {
+		return true
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for scanner.Scan() {
-		if strings.Contains(strings.ToLower(scanner.Text()), queryLower) {
-			return true
+
+	maxLen := 0
+	for _, n := range needles {
+		if len(n) > maxLen {
+			maxLen = len(n)
 		}
 	}
-	return false
+	overlap := maxLen - 1
+	if overlap < 0 {
+		overlap = 0
+	}
+
+	found := make([]bool, len(needles))
+	remaining := len(needles)
+
+	r := bufio.NewReaderSize(f, 1<<20)
+	chunk := make([]byte, 1<<20)
+	window := make([]byte, 0, (1<<20)+overlap)
+
+	for {
+		n, err := r.Read(chunk)
+		if n > 0 {
+			asciiLowerInPlace(chunk[:n])
+			window = append(window, chunk[:n]...)
+			for i, nd := range needles {
+				if !found[i] && bytes.Contains(window, nd) {
+					found[i] = true
+					remaining--
+				}
+			}
+			if remaining == 0 {
+				return true
+			}
+			if len(window) > overlap {
+				copy(window, window[len(window)-overlap:])
+				window = window[:overlap]
+			}
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
+
+// asciiLowerInPlace lowercases ASCII A-Z in b, leaving UTF-8 multibyte
+// sequences (bytes >= 0x80) untouched.
+func asciiLowerInPlace(b []byte) {
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+}
+
+func asciiLower(b []byte) []byte {
+	out := make([]byte, len(b))
+	copy(out, b)
+	asciiLowerInPlace(out)
+	return out
 }
 
 func extractPromptText(raw json.RawMessage) string {
@@ -665,12 +862,12 @@ Usage:
   ccs -h           Show this help
 
 Keys:
-  /                Start filtering (metadata)
-  ctrl+f           Search session contents
+  / or ctrl+f      Search names + contents (type to filter)
+  ↑/↓              Move selection (works while searching)
   tab              Toggle named / all sessions
   ctrl+a           Toggle active-only
-  enter            Select session
-  esc              Clear content search / quit
+  enter            Select / resume session
+  esc              Clear search / quit
   q                Quit`)
 			return
 		case "-v", "--version":
@@ -698,10 +895,13 @@ Keys:
 	l := list.New(nil, delegate, 80, 22)
 	l.Title = "Claude Sessions"
 	l.Styles.Title = headerStyle
-	l.SetFilteringEnabled(true)
+	// Built-in filtering is disabled: it highlights matches by splicing style
+	// codes into our already-styled Title strings, which corrupts the render.
+	// We do our own combined name+content search instead.
+	l.SetFilteringEnabled(false)
 	l.SetShowHelp(true)
 	l.AdditionalShortHelpKeys = func() []key.Binding {
-		return []key.Binding{keys.toggleAll, keys.toggleActive, keys.contentSearch}
+		return []key.Binding{keys.search, keys.toggleAll, keys.toggleActive}
 	}
 
 	ti := textinput.New()
