@@ -31,7 +31,9 @@ type Session struct {
 	Summary     string
 	MsgCount    int
 	Created     time.Time
-	Modified    time.Time
+	Modified    time.Time      // last activity of any kind (used as a fallback)
+	LastMsg     time.Time      // last time the user sent a real message ("interacted")
+	LastPrompt  string         // text of the most recent user message
 	GitBranch   string
 	ProjectPath string
 	Active      bool
@@ -61,6 +63,7 @@ type jsonlEntry struct {
 	Timestamp   string          `json:"timestamp"`
 	Message     json.RawMessage `json:"message"`
 	CustomTitle string          `json:"customTitle"`
+	LastPrompt  string          `json:"lastPrompt"`
 }
 
 type msgContent struct {
@@ -84,10 +87,53 @@ type item struct {
 	session      Session
 	projectShort string
 	jsonlPath    string
+	sortTime     time.Time // timestamp shown in the age column (reflects active sort)
+}
+
+// sortMode selects which timestamp drives ordering and the age column.
+type sortMode int
+
+const (
+	sortRecent  sortMode = iota // most recently interacted with
+	sortCreated                 // when the session was first started
+)
+
+func (s sortMode) label() string {
+	if s == sortCreated {
+		return "created"
+	}
+	return "recent"
+}
+
+// sortKey is the timestamp a session is ordered by under the given mode.
+func sortKey(it item, mode sortMode) time.Time {
+	if mode == sortCreated {
+		return it.session.Created
+	}
+	if !it.session.LastMsg.IsZero() {
+		return it.session.LastMsg
+	}
+	return it.session.Modified
+}
+
+func sortItems(items []item, mode sortMode) {
+	sort.Slice(items, func(i, j int) bool {
+		return sortKey(items[i], mode).After(sortKey(items[j], mode))
+	})
+}
+
+func (i item) ageTime() time.Time {
+	if !i.sortTime.IsZero() {
+		return i.sortTime
+	}
+	if !i.session.LastMsg.IsZero() {
+		return i.session.LastMsg
+	}
+	return i.session.Modified
 }
 
 func (i item) Title() string {
-	age := formatAge(i.session.Modified)
+	age := formatAge(i.ageTime())
 	active := ""
 	if i.session.Active {
 		active = activeStyle.Render(" ●")
@@ -100,36 +146,53 @@ func (i item) Title() string {
 	summary := i.session.Summary
 	if summary == "" {
 		summary = i.session.FirstPrompt
-		if len(summary) > 70 {
-			summary = summary[:67] + "..."
-		}
 	}
 	branch := ""
 	if b := i.session.GitBranch; b != "" && b != "HEAD" && b != "main" && b != "master" {
 		branch = "  " + branchStyle.Render(b)
 	}
-	return fmt.Sprintf("%s  %s%s%s", ageStyle.Render(age), titleStyle.Render(summary), branch, active)
+	return fmt.Sprintf("%s  %s%s%s", ageStyle.Render(age), titleStyle.Render(oneLine(summary, 70)), branch, active)
 }
 
 func (i item) Description() string {
-	parts := []string{pathStyle.Render(i.projectShort)}
-	parts = append(parts, countStyle.Render(fmt.Sprintf("%d msgs", i.session.MsgCount)))
+	parts := []string{
+		pathStyle.Render(i.projectShort),
+		countStyle.Render(fmt.Sprintf("%d msgs", i.session.MsgCount)),
+	}
 
-	desc := i.session.Summary
-	if i.session.Name == "" || desc == "" {
-		desc = i.session.FirstPrompt
-	}
-	if len(desc) > 80 {
-		desc = desc[:77] + "..."
-	}
-	if desc != "" {
-		parts = append(parts, promptStyle.Render(desc))
+	// The latest user message says where the session ended up — usually more
+	// useful for "which session was this?" than how it started. Mark it "↳" so
+	// it reads as the last message, not a summary.
+	if latest := i.session.LastPrompt; latest != "" {
+		parts = append(parts, promptStyle.Render("↳ "+oneLine(latest, 80)))
+	} else if desc := firstNonEmpty(i.session.Summary, i.session.FirstPrompt); desc != "" {
+		parts = append(parts, promptStyle.Render(oneLine(desc, 80)))
 	}
 	return strings.Join(parts, "  ")
 }
 
 func (i item) FilterValue() string {
-	return i.session.Name + " " + i.session.Summary + " " + i.session.FirstPrompt + " " + i.session.ProjectPath + " " + i.session.GitBranch
+	return i.session.Name + " " + i.session.Summary + " " + i.session.FirstPrompt + " " + i.session.LastPrompt + " " + i.session.ProjectPath + " " + i.session.GitBranch
+}
+
+// oneLine collapses all whitespace (including newlines) to single spaces and
+// truncates to max runes, so a multi-line prompt renders as a tidy single line.
+func oneLine(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) > max {
+		return string(r[:max-3]) + "..."
+	}
+	return s
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // ── Styles ──────────────────────────────────────────────────────────
@@ -156,6 +219,7 @@ type keyMap struct {
 	search       key.Binding
 	toggleAll    key.Binding
 	toggleActive key.Binding
+	toggleSort   key.Binding
 }
 
 var keys = keyMap{
@@ -171,6 +235,10 @@ var keys = keyMap{
 		key.WithKeys("ctrl+a"),
 		key.WithHelp("ctrl+a", "active only"),
 	),
+	toggleSort: key.NewBinding(
+		key.WithKeys("s"),
+		key.WithHelp("s", "sort recent/created"),
+	),
 }
 
 // ── Model ───────────────────────────────────────────────────────────
@@ -180,6 +248,7 @@ type model struct {
 	allItems   []item // full unfiltered set
 	namedOnly  bool
 	activeOnly bool
+	sort       sortMode
 	selected   *item
 	quitting   bool
 	width      int
@@ -231,7 +300,7 @@ func (m model) applyFilters() model {
 	// while typing they lag behind until the debounced scan catches up.
 	contentCurrent := m.contentMatches != nil && m.contentQuery == m.query()
 
-	var filtered []list.Item
+	var filtered []item
 	for _, it := range m.allItems {
 		if m.namedOnly && it.session.Name == "" {
 			continue
@@ -248,7 +317,14 @@ func (m model) applyFilters() model {
 		}
 		filtered = append(filtered, it)
 	}
-	m.list.SetItems(filtered)
+
+	sortItems(filtered, m.sort)
+	listItems := make([]list.Item, len(filtered))
+	for i := range filtered {
+		filtered[i].sortTime = sortKey(filtered[i], m.sort) // age column follows the sort
+		listItems[i] = filtered[i]
+	}
+	m.list.SetItems(listItems)
 	return m
 }
 
@@ -259,6 +335,7 @@ func metaContainsAll(it item, termsLower []string) bool {
 		it.session.Name,
 		it.session.Summary,
 		it.session.FirstPrompt,
+		it.session.LastPrompt,
 		it.projectShort,
 		it.session.ProjectPath,
 		it.session.GitBranch,
@@ -289,6 +366,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case key.Matches(msg, keys.toggleActive):
 			m.activeOnly = !m.activeOnly
+			m = m.applyFilters()
+			return m, nil
+		case key.Matches(msg, keys.toggleSort):
+			if m.sort == sortRecent {
+				m.sort = sortCreated
+			} else {
+				m.sort = sortRecent
+			}
 			m = m.applyFilters()
 			return m, nil
 		}
@@ -413,7 +498,8 @@ func (m model) View() string {
 	} else {
 		namedLabel := filterToggle("named", m.namedOnly)
 		activeLabel := filterToggle("active", m.activeOnly)
-		left := fmt.Sprintf("%s  %s", namedLabel, activeLabel)
+		sortLabel := filterOffStyle.Render("↕ " + m.sort.label())
+		left := fmt.Sprintf("%s  %s  %s", namedLabel, activeLabel, sortLabel)
 		if q := m.query(); q != "" {
 			left += "  " + filterOnStyle.Render("search: "+q)
 		}
@@ -456,26 +542,90 @@ func loadActiveSessions() map[string]string {
 	return active
 }
 
-func extractCustomTitle(path string) string {
+// scanJSONL calls fn for each line of a JSONL file. It uses a growing reader so
+// arbitrarily long lines (multi-MB tool output, base64 images) never truncate
+// the scan — unlike a fixed-buffer bufio.Scanner.
+func scanJSONL(path string, fn func(line []byte)) {
 	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		return
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) < 300 && strings.Contains(string(line), "custom-title") {
-			var entry jsonlEntry
-			if json.Unmarshal(line, &entry) == nil && entry.Type == "custom-title" && entry.CustomTitle != "" {
-				return entry.CustomTitle
-			}
+	r := bufio.NewReaderSize(f, 1<<20)
+	for {
+		line, err := r.ReadBytes('\n')
+		if len(line) > 0 {
+			fn(line)
+		}
+		if err != nil {
+			return // io.EOF or read error: stop
 		}
 	}
-	return ""
+}
+
+// realPrompt reports whether text is a genuine user message, filtering out the
+// empty tool-result envelopes and the <command-*>/<local-command-*>/Caveat
+// wrappers Claude Code injects for slash commands and hooks.
+func realPrompt(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	if t[0] == '<' || strings.HasPrefix(t, "Caveat:") {
+		return false
+	}
+	return true
+}
+
+// sessionMeta is the tail information we scan a session's JSONL for: its custom
+// title, latest user prompt, and when the user last interacted.
+type sessionMeta struct {
+	customTitle     string
+	lastPromptEntry string    // from Claude Code's own "last-prompt" record
+	lastPromptMsg   string    // fallback: last real user message text
+	lastMsg         time.Time // timestamp of the last real user message
+}
+
+func (sm sessionMeta) lastPrompt() string {
+	return firstNonEmpty(sm.lastPromptEntry, sm.lastPromptMsg)
+}
+
+// extractMeta scans a session file for supplementary metadata not in the index.
+// It cheaply skips the big assistant / tool-result lines it doesn't care about.
+func extractMeta(path string) sessionMeta {
+	var sm sessionMeta
+	scanJSONL(path, func(line []byte) {
+		isLastPrompt := bytes.Contains(line, []byte(`"type":"last-prompt"`))
+		isCustom := bytes.Contains(line, []byte(`"type":"custom-title"`))
+		// Real user prompts are "user" lines that aren't tool_result envelopes.
+		isUser := bytes.Contains(line, []byte(`"type":"user"`)) && !bytes.Contains(line, []byte(`"tool_result"`))
+		if !isLastPrompt && !isCustom && !isUser {
+			return
+		}
+		var e jsonlEntry
+		if json.Unmarshal(line, &e) != nil {
+			return
+		}
+		switch e.Type {
+		case "custom-title":
+			if e.CustomTitle != "" {
+				sm.customTitle = e.CustomTitle
+			}
+		case "last-prompt":
+			if e.LastPrompt != "" {
+				sm.lastPromptEntry = e.LastPrompt
+			}
+		case "user":
+			if text := extractPromptText(e.Message); realPrompt(text) {
+				sm.lastPromptMsg = text
+				if ts, err := time.Parse(time.RFC3339, e.Timestamp); err == nil {
+					sm.lastMsg = ts
+				}
+			}
+		}
+	})
+	return sm
 }
 
 func loadAllSessions() []item {
@@ -487,44 +637,82 @@ func loadAllSessions() []item {
 	activeSessions := loadActiveSessions()
 	projectDirs, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*"))
 
-	var items []item
+	// Every session needs a JSONL scan (indexed ones for their tail metadata,
+	// un-indexed ones for everything), so gather the work first and run it in
+	// parallel — 300+ MB scanned sequentially at startup is noticeably slow.
+	type job struct {
+		indexed bool
+		base    item // prefilled from the index (indexed jobs only)
+		path    string
+	}
+	var jobs []job
 	for _, dir := range projectDirs {
 		indexed := loadFromIndex(dir, home)
 		indexedIDs := make(map[string]bool)
-		for idx := range indexed {
-			sid := indexed[idx].session.SessionID
+		for _, it := range indexed {
+			sid := it.session.SessionID
 			indexedIDs[sid] = true
-
-			jf := filepath.Join(dir, sid+".jsonl")
-			indexed[idx].jsonlPath = jf
-			if title := extractCustomTitle(jf); title != "" {
-				indexed[idx].session.Name = title
-			}
-			if _, ok := activeSessions[sid]; ok {
-				indexed[idx].session.Active = true
-				if name := activeSessions[sid]; name != "" && indexed[idx].session.Name == "" {
-					indexed[idx].session.Name = name
-				}
-			}
-			items = append(items, indexed[idx])
+			it.jsonlPath = filepath.Join(dir, sid+".jsonl")
+			jobs = append(jobs, job{indexed: true, base: it, path: it.jsonlPath})
 		}
-
 		jsonls, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
 		for _, jf := range jsonls {
 			sid := strings.TrimSuffix(filepath.Base(jf), ".jsonl")
-			if indexedIDs[sid] {
-				continue
-			}
-			if s := loadFromJSONL(jf, home, activeSessions); s != nil {
-				items = append(items, *s)
+			if !indexedIDs[sid] {
+				jobs = append(jobs, job{path: jf})
 			}
 		}
 	}
 
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].session.Modified.After(items[j].session.Modified)
-	})
+	results := make([]*item, len(jobs))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU())
+	for i := range jobs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if jobs[i].indexed {
+				results[i] = enrichIndexed(jobs[i].base, jobs[i].path, activeSessions)
+			} else {
+				results[i] = loadFromJSONL(jobs[i].path, home, activeSessions)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	var items []item
+	for _, r := range results {
+		if r != nil {
+			items = append(items, *r)
+		}
+	}
+	sortItems(items, sortRecent)
 	return items
+}
+
+// enrichIndexed supplements an index-derived item with the tail metadata only a
+// file scan can provide (custom title, latest prompt, last-interacted time).
+func enrichIndexed(it item, path string, activeSessions map[string]string) *item {
+	meta := extractMeta(path)
+	if meta.customTitle != "" {
+		it.session.Name = meta.customTitle
+	}
+	if lp := meta.lastPrompt(); lp != "" {
+		it.session.LastPrompt = lp
+	}
+	it.session.LastMsg = meta.lastMsg
+	if it.session.LastMsg.IsZero() {
+		it.session.LastMsg = it.session.Modified
+	}
+	if _, ok := activeSessions[it.session.SessionID]; ok {
+		it.session.Active = true
+		if name := activeSessions[it.session.SessionID]; name != "" && it.session.Name == "" {
+			it.session.Name = name
+		}
+	}
+	return &it
 }
 
 func loadFromIndex(dir, home string) []item {
@@ -562,36 +750,34 @@ func loadFromIndex(dir, home string) []item {
 }
 
 func loadFromJSONL(path, home string, activeSessions map[string]string) *item {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
 	var (
-		sessionID   string
-		customTitle string
-		cwd         string
-		branch      string
-		firstPrompt string
-		firstTS     time.Time
-		lastTS      time.Time
-		msgCount    int
+		sessionID       string
+		customTitle     string
+		lastPromptEntry string
+		lastPromptMsg   string
+		cwd             string
+		branch          string
+		firstPrompt     string
+		firstTS         time.Time
+		lastTS          time.Time
+		lastUserTS      time.Time
+		msgCount        int
 	)
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-
-	for scanner.Scan() {
+	scanJSONL(path, func(line []byte) {
 		var entry jsonlEntry
-		if json.Unmarshal(scanner.Bytes(), &entry) != nil {
-			continue
+		if json.Unmarshal(line, &entry) != nil {
+			return
 		}
 
 		switch entry.Type {
 		case "custom-title":
 			if entry.CustomTitle != "" {
 				customTitle = entry.CustomTitle
+			}
+		case "last-prompt":
+			if entry.LastPrompt != "" {
+				lastPromptEntry = entry.LastPrompt
 			}
 		case "user":
 			msgCount++
@@ -600,14 +786,21 @@ func loadFromJSONL(path, home string, activeSessions map[string]string) *item {
 				cwd = entry.CWD
 				branch = entry.GitBranch
 			}
-			if ts, err := time.Parse(time.RFC3339, entry.Timestamp); err == nil {
+			ts, tsErr := time.Parse(time.RFC3339, entry.Timestamp)
+			if tsErr == nil {
 				if firstTS.IsZero() {
 					firstTS = ts
 				}
 				lastTS = ts
 			}
-			if firstPrompt == "" {
-				firstPrompt = extractPromptText(entry.Message)
+			if text := extractPromptText(entry.Message); realPrompt(text) {
+				if firstPrompt == "" {
+					firstPrompt = text
+				}
+				lastPromptMsg = text
+				if tsErr == nil {
+					lastUserTS = ts
+				}
 			}
 		case "assistant":
 			msgCount++
@@ -615,10 +808,15 @@ func loadFromJSONL(path, home string, activeSessions map[string]string) *item {
 				lastTS = ts
 			}
 		}
-	}
+	})
 
 	if msgCount < 2 || sessionID == "" {
 		return nil
+	}
+
+	lastPrompt := firstNonEmpty(lastPromptEntry, lastPromptMsg)
+	if lastUserTS.IsZero() {
+		lastUserTS = lastTS
 	}
 
 	if cwd == "" {
@@ -642,9 +840,11 @@ func loadFromJSONL(path, home string, activeSessions map[string]string) *item {
 			SessionID:   sessionID,
 			Name:        customTitle,
 			FirstPrompt: firstPrompt,
+			LastPrompt:  lastPrompt,
 			MsgCount:    msgCount,
 			Created:     firstTS,
 			Modified:    lastTS,
+			LastMsg:     lastUserTS,
 			GitBranch:   branch,
 			ProjectPath: cwd,
 			Active:      active,
@@ -841,7 +1041,7 @@ func main() {
 					active = " ●"
 				}
 				fmt.Printf("%-10s %-30s %s (%s msgs)%s\n",
-					formatAge(it.session.Modified),
+					formatAge(it.ageTime()),
 					it.projectShort,
 					name,
 					strconv.Itoa(it.session.MsgCount),
@@ -866,6 +1066,7 @@ Keys:
   ↑/↓              Move selection (works while searching)
   tab              Toggle named / all sessions
   ctrl+a           Toggle active-only
+  s                Toggle sort (recent / created)
   enter            Select / resume session
   esc              Clear search / quit
   q                Quit`)
@@ -901,11 +1102,11 @@ Keys:
 	l.SetFilteringEnabled(false)
 	l.SetShowHelp(true)
 	l.AdditionalShortHelpKeys = func() []key.Binding {
-		return []key.Binding{keys.search, keys.toggleAll, keys.toggleActive}
+		return []key.Binding{keys.search, keys.toggleAll, keys.toggleActive, keys.toggleSort}
 	}
 
 	ti := textinput.New()
-	ti.Placeholder = "search session contents..."
+	ti.Placeholder = "search names + contents..."
 	ti.Prompt = "search: "
 	ti.CharLimit = 200
 	ti.Width = 60
